@@ -1,9 +1,17 @@
+from typing import Dict, List, Union
+
 import torch.nn as nn
 import torch
 from tricks.qr_embedding_bag import QREmbeddingBag
 import math
 import os
 import time
+from  torchrec import (
+    EmbeddingBagCollection, 
+    EmbeddingBagConfig, 
+    PoolingType, 
+    KeyedJaggedTensor
+)
 
 class DLRM(nn.Module):
     def __init__(self, input_size, b_mlp_layers, t_mlp_layers, emb_layers, qr_flag = True):
@@ -241,3 +249,193 @@ class DLRMSolver:
                 self._save(loss = epoch_loss, epoch = epoch, filepath = os.path.join(self.checkpoint_dir, f"last_checkpoint.pth"))
             
             self.loss_history.append(epoch_loss)
+
+
+
+# sparse architecture using torchrec primitives such as EmbeddingBagCollection
+# This enables optimizations such as embedding table lookups simultaneously across multiple tables with varying (jagged) features
+# fused optimizers allows backward pass and step in a single kernel without doubling memory utilization, traditionally gradients require the same memory as the parameters
+# enable DMP for sparse vectors, huge embedding tables are spread across ranks, especially useful when working with limited HBM
+class Sparse(nn.Module):
+    def __init__(
+            self, 
+            feat_tables: Dict[str, Dict[str, Union[int, List]]]= {},
+            emb_dim: int = 32,
+            device: str = "meta"
+        ) -> None:
+        """
+        Args:
+            feat_tables (Dict[str, Dict[str, Union[int, List]]]): dictionary with embedding tables, each specifying vocab size and features that belong to it
+            emb_dim (int): size of the embeddings, must be equal for all tables to perform dot interactions.
+            device (str): device to load tensors on
+        """
+        super().__init__()
+        self.feat_tables = feat_tables
+        self.emb_dim = emb_dim
+        self.device = device
+
+        # Q: why should we explicitly define device if it can be specified from model.to(device)?
+        # A: if large embedding tables need to be moved to GPU this approach avoids the CPU intermediate allocation
+        # ugly? Yes! practical? Yes!
+        self.ebc = EmbeddingBagCollection(
+            device = self.device,
+            tables = [
+                EmbeddingBagConfig(
+                    name=table_name,
+                    embedding_dim=self.emb_dim,
+                    num_embeddings=table["vocab_size"],
+                    feature_names=table["features"],
+                    pooling=PoolingType.SUM,
+                )
+                for table_name, table in self.feat_tables.items()
+            ]
+        )
+
+    def forward(self, kjt: KeyedJaggedTensor) -> torch.Tensor:
+        """
+        Args:
+            kjt (torchrec.KeyedJaggedTensor): KeyedJaggedTensor data structure contains multi-hot, varying values for all sparse features for a batch of records
+        Returns:
+            output (torch.tensor): embedding lookup output tensor of size [B, F, D]. B - Batch, F - number of features, D - dimension of the pooled embedding lookup
+        """
+        output = self.ebc(kjt)
+        B = output.values().shape[0]
+        return output.values().reshape(B, -1, self.emb_dim)
+
+# pretty much identical to the original dense layers
+# goal is to enable DP for dense layers to increase compute throughput
+class Dense(nn.Module):
+    def __init__(
+            self,
+            input_dim: int = 5,
+            dense_layers: List[int] = [],
+            device: str = "meta"
+        ) -> None:
+        super().__init__()
+        self.device = device
+
+        self.dense = nn.ModuleList()
+        for i in range(len(dense_layers)):
+            if i == 0:
+                self.dense.append(nn.Linear(in_features=input_dim, out_features=dense_layers[i], device=self.device))
+            else:
+                self.dense.append(nn.Linear(in_features=dense_layers[i-1], out_features=dense_layers[i], device=self.device))
+            if i < len(dense_layers)-1:
+                self.dense.append(nn.ReLU())
+        
+        self.dense = nn.Sequential(*self.dense)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): input tensor of size [B, M]. B - batch size, M - number of dense features
+        Returns:
+            output (torch.tensor): output tensor of size [B, D]
+        """
+        return self.dense(x)
+
+class Interaction(nn.Module):
+    def __init__(self, F: int) -> None:
+        """
+        It is assumed that at least 1 dense feature is provided
+        Args:
+            F (int): number of sparse features
+        """
+        super().__init__()
+        # DMPCollection automatically moves buffered values, torch.triu_indices(...), to the right device 
+        self.register_buffer(
+            "triu_indices",
+            # precompute rows and cols of upper triangular
+            # notice that it is independent of batch size
+            # saves time from recomputing on every forward pass
+            torch.triu_indices(F + 1, F + 1, offset=1),
+            persistent=False, # do not save in state_dict, not necessary
+        )
+
+    def forward(self, sparse_x: torch.Tensor, dense_x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            sparse_x (torch.Tensor): sparse input tensor of size [B, F, D]
+            dense_x (torch.Tensor): dense input tensor of size [B, D]
+        Returns:
+            output (torch.tensor): output tensor of size [B, K], upper triangular of the matrix product [B, F+1, D] @ [B, F+1, D].Transpose
+        """
+
+        dense_x = dense_x.unsqueeze(-1).transpose(1, 2)
+
+        # concat([B, F, D], [B, 1, D]) -> [B, F+1, D]
+        combined = torch.concat([sparse_x, dense_x], dim=1)
+        # BMM([B, F+1, D], [B, D, F+1]) -> [B, F+1, F+1]
+        interact = torch.bmm(combined, combined.transpose(1, 2))
+        
+        # get upper triangular for unique interactions, exlude diagonal since 
+        # we only care about pairwise feature interactions with other features, not to themselves
+        
+        # this line not needes since upper triangular values were buffered during init
+        # row, col = torch.triu_indices(interact.shape[1], interact.shape[2], offset=1)
+
+        # (B, F+1, F+1) -> (B, K) where K = (F+1)*(F) // 2
+        return interact[:, self.triu_indices[0], self.triu_indices[1]]
+
+
+
+class DLRMDist(nn.Module):
+    def __init__(
+            self,
+            # sparse params
+            feat_tables: Dict[str, Dict[str, Union[int, List]]]= {},
+            emb_dim: int = 32,
+            device: str = "meta", # DMP will automatically handle materialization, without DMP the device must be specified explicitly for sparse layer along with model.to(device) for dense layers
+            # bottom MLP dense params
+            dense_dim: int = 5,
+            bottom_dense_layers: List[int] = [],
+            # top MLP dense params
+            top_dense_layers: List[int] = []
+            
+        ) -> None:
+        super().__init__()
+
+        assert len(bottom_dense_layers) > 0, "dense_layer cannot be empty!" 
+        assert bottom_dense_layers[-1] == emb_dim, "Output dimension for dense and sparse features but be equal!"
+
+
+        F = sum([len(feat_tables[table]["features"]) for table in feat_tables]) # number of sparse features
+
+        # initialize layers
+        self.sparse = Sparse(
+            feat_tables = feat_tables,
+            emb_dim = emb_dim,
+            device = device
+        )
+
+        self.bottom_mlp = Dense(
+            input_dim = dense_dim,
+            dense_layers = bottom_dense_layers,
+            device = device
+        )
+
+        self.interaction = Interaction(
+            F = F
+        )
+
+        self.top_mlp = Dense(
+            input_dim = bottom_dense_layers[-1] + ((F+1)*(F) // 2),
+            dense_layers = top_dense_layers,
+            device = device
+        )
+    
+    def forward(self, dense_x: torch.Tensor, kjt: KeyedJaggedTensor) -> torch.Tensor:
+        """
+        Args:
+            dense_x (torch.Tensor): dense input tensor of size [B, D]
+            kjt (torchrec.KeyedJaggedTensor): KeyedJaggedTensor data structure contains multi-hot, varying values for all sparse features for a batch of records
+        Returns:
+            output (torch.tensor): embedding lookup output tensor of size [B, F, D]. B - Batch, F - number of features, D - dimension of the pooled embedding lookup
+        """
+        
+        sparse_x = self.sparse(kjt) # KJT -> [B, F, D]
+        dense_x = self.bottom_mlp(dense_x) # [B, M] -> [B, D], B - batch size, M - num dense features
+        interact = self.interaction(sparse_x, dense_x) # -> [B, K], K = (F+1)*F // 2
+        
+        return self.top_mlp(torch.concat([dense_x, interact], dim = 1)) # [B, K+D] -> [B, T], T - num tasks
+

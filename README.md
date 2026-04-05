@@ -13,6 +13,7 @@ DLRM-Ranking/
 ├── dlrm_data_pytorch.py   # Data generation and loading utilities for DLRM benchmarks
 ├── data_utils.py          # Downloading and preprocessing public datasets (Criteo, etc.)
 ├── demo.ipynb             # Example notebook: model instantiation and forward pass demo
+├── DDP.py                 # Defines Trainer for multi-node (GPU) DDP. The script uses a dummy model architecture and data to simply test DDP
 ├── tricks/                # Embedding compression modules
 │   ├── qr_embedding_bag.py   # Quotient-Remainder Embedding implementation
 │   └── md_embedding_bag.py   # Mixed-Dimension Embedding implementation
@@ -38,6 +39,28 @@ This project uses the [Criteo Kaggle Display Advertising Challenge dataset](http
     - **Mixed-Dimension Embedding**: Adjusts embedding dimension based on feature cardinality and popularity ([paper](https://arxiv.org/pdf/1909.11810)).
 - Embedding bags simplify categorical input representation for efficient batch processing.
 
+
+## Distributed Data Parallelism using Torchrun
+Torchrun simplifies DDP by automating tasks such as spawing multiple processes, defining env variables (RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT), automatic restart of the processes during failure (customize to restart from a snapshot), scaling from a single to multi-node cluster...
+Make sure that you have gpu devices with proper nvidia drivers and run the following on each node!
+```bash
+torchrun \
+# value could vary between nodes, this one hace 2 GPUs
+--nproc-per-node=2 \
+# total count of nodes, that way torchrun begins when all nodes are ready
+--nnodes=1
+# unique per node, next node should use node_rank=1
+--node_rank=0 \
+# unique for the process group
+--rdzv_id=456 \
+--rdzv_backend=c10d \
+# pick one of the nodes and unused port
+# my example is for a single node multi-worker job
+--rdzv_endpoint=127.0.0.1:29603 \
+# custom train script
+DDP.py 50 10 --aws_access_key=<AWS-KEY> --aws_access_secret="<AWS-SECRET>"
+```
+
 ## References
 1. [Deep Learning Recommendation Model for Personalization and Recommendation Systems](https://arxiv.org/pdf/1906.00091)
 2. [The Architectural Implications of Facebook’s DNN-based Personalized Recommendation](https://arxiv.org/pdf/1906.03109)
@@ -46,3 +69,4 @@ This project uses the [Criteo Kaggle Display Advertising Challenge dataset](http
 5. [Criteo Kaggle Dataset](https://www.kaggle.com/competitions/criteo-display-ad-challenge/overview)
 6. [Compositional Embeddings Using Complementary Partitions for Memory-Efficient Recommendation Systems](https://arxiv.org/pdf/1909.02107)
 7. [Mixed Dimension Embeddings with Application to Memory-Efficient Recommendation Systems](https://arxiv.org/pdf/1909.11810)
+8. [Scaling Recommendation Systems Training to Thousands of GPUs with 2D Sparse Parallelism](https://pytorch.org/blog/scaling-recommendation-2d-sparse-parallelism)
