@@ -61,6 +61,31 @@ torchrun \
 DDP.py 50 10 --aws_access_key=<AWS-KEY> --aws_access_secret="<AWS-SECRET>"
 ```
 
+## 2D parralelism using DMPCollection API
+Amazing [blog](https://pytorch.org/blog/scaling-recommendation-2d-sparse-parallelism) worth mentioning. It explains the concept of how TorchRec's DMPCollection API achieves 2D parallelism efficiently:
+- The 2 dimensions of parallelism are data parallelism, for dense architecture, and model parallelism, for really large embedding tables
+- each rank has two groups, sharding and replica, associated to it
+- equivalent shards for different model replicas are placed on the same node (which can contain multiple ranks) to maximize intra-node communication during all reduce synchronization, which is fasteer than inter-node communication.
+    - e.g. 8 GPUs (T=8) with a sharding group size of 4 (L=4), will create 2 model replicas (G = T/L). 
+    - Using a simple formula, [i, G+i, 2G+i, ...], sharding group 0 (G = 0) is has its model shards placed at [0, 2, 4, 8] and sharding group 1 (G=1) has its shards placed at [1, 3, 5, 7]. This increases chances that equal replica groups or equivalent shards of different replicas models are placed close to each other, so during parameter synchronization, all reduce can run average within the same node.
+
+Unfortunately, there are not a lot of practical examples for the implementation, so the best way to understand the DMPCollection API is by reading the [source code](https://github.com/meta-pytorch/torchrec/blob/main/torchrec/distributed/model_parallel.py#L1014).
+
+Here is how I understand 2D parallelism:
+- Sparse tables are sharded across the ranks in a sharding group.
+- Dense layers are replicated across all global ranks, this is fine if they use less memory compared to the embedding tables
+- Ranks in the same sharding group cooperate to execute one logical sparse model.
+- Different sharding groups are replica copies of that logical model.
+
+Saving DMP models are made simple using torch.distributed.checkpoint (see [doc](https://docs.pytorch.org/tutorials/recipes/distributed_checkpoint_recipe.html))
+
+Torchrun can be used to execute 2D parallelized script as well:
+```bash
+# could use --standalone flag in DDP as well since I am using only a single node
+# my example is running a single node with 4 GPUs, world_size = 4, sharding_groups = 2, replica_groups = 2
+torchrun --standalone --nproc-per-node=4 2DP.py 70 10 --sharding_group_size 2 --aws_access_key=<AWS-KEY> --aws_access_secret="<AWS-SECRET>"
+```
+
 ## References
 1. [Deep Learning Recommendation Model for Personalization and Recommendation Systems](https://arxiv.org/pdf/1906.00091)
 2. [The Architectural Implications of Facebook’s DNN-based Personalized Recommendation](https://arxiv.org/pdf/1906.03109)

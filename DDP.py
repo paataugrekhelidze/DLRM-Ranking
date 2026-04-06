@@ -171,7 +171,7 @@ if __name__ == "__main__":
     parser.add_argument('--aws_access_key', type=str, help='Your AWS access key')
     parser.add_argument('--aws_access_secret', type=str, help='Your AWS secret key')
     parser.add_argument('--aws_region', default="us-west-2", type=str, help='AWS region (default: us-west-2)')
-    parser.add_argument('--snapshot_path', default="s3://ml-paugre/dlrm-ranking/train/snapshot.pt", type=str, help='Snapshot Path for model artifacts')
+    parser.add_argument('--snapshot_path', default="s3://<MYBUCKET>/dlrm-ranking/train/snapshot.pt", type=str, help='Snapshot Path for model artifacts')
     args = parser.parse_args()
 
     main(args.save_every, args.total_epochs, args.aws_access_key, args.aws_access_secret, args.aws_region, args.batch_size, args.snapshot_path)
